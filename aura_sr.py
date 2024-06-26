@@ -9,7 +9,7 @@ from typing import Any, Optional, List, Iterable
 import torch
 from torchvision import transforms
 from PIL import Image
-from torch import nn, einsum, Tensor
+from torch import nn, Tensor
 import torch.nn.functional as F
 
 from einops import rearrange, repeat, reduce
@@ -125,36 +125,17 @@ class AdaptiveConv2DMod(nn.Module):
 
 
 class Attend(nn.Module):
-    def __init__(self, dropout=0.0, flash=False):
+    def __init__(self, dropout=0.0):
         super().__init__()
         self.dropout = dropout
         self.attn_dropout = nn.Dropout(dropout)
         self.scale = nn.Parameter(torch.randn(1))
-        self.flash = flash
 
-    def flash_attn(self, q, k, v):
+    def forward(self, q, k, v):
         q, k, v = map(lambda t: t.contiguous(), (q, k, v))
         out = F.scaled_dot_product_attention(
             q, k, v, dropout_p=self.dropout if self.training else 0.0
         )
-        return out
-
-    def forward(self, q, k, v):
-        if self.flash:
-            return self.flash_attn(q, k, v)
-
-        scale = q.shape[-1] ** -0.5
-
-        # similarity
-        sim = einsum("b h i d, b h j d -> b h i j", q, k) * scale
-
-        # attention
-        attn = sim.softmax(dim=-1)
-        attn = self.attn_dropout(attn)
-
-        # aggregate values
-        out = einsum("b h i j, b h j d -> b h i d", attn, v)
-
         return out
 
 
@@ -185,6 +166,7 @@ def is_power_of_two(n):
 def null_iterator():
     while True:
         yield None
+
 
 def Downsample(dim, dim_out=None):
     return nn.Sequential(
@@ -284,14 +266,14 @@ class LinearAttention(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads=4, dim_head=32, flash=False):
+    def __init__(self, dim, heads=4, dim_head=32):
         super().__init__()
         self.heads = heads
         hidden_dim = dim_head * heads
 
         self.norm = RMSNorm(dim)
 
-        self.attend = Attend(flash=flash)
+        self.attend = Attend()
         self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
         self.to_out = nn.Conv2d(hidden_dim, dim, 1)
 
@@ -322,7 +304,7 @@ def FeedForward(dim, mult=4):
 
 # transformers
 class Transformer(nn.Module):
-    def __init__(self, dim, dim_head=64, heads=8, depth=1, flash_attn=True, ff_mult=4):
+    def __init__(self, dim, dim_head=64, heads=8, depth=1, ff_mult=4):
         super().__init__()
         self.layers = nn.ModuleList([])
 
@@ -330,9 +312,7 @@ class Transformer(nn.Module):
             self.layers.append(
                 nn.ModuleList(
                     [
-                        Attention(
-                            dim=dim, dim_head=dim_head, heads=heads, flash=flash_attn
-                        ),
+                        Attention(dim=dim, dim_head=dim_head, heads=heads),
                         FeedForward(dim=dim, mult=ff_mult),
                     ]
                 )
@@ -376,7 +356,6 @@ class NearestNeighborhoodUpsample(nn.Module):
         self.conv = nn.Conv2d(dim, dim_out, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
-
         if x.shape[0] >= 64:
             x = x.contiguous()
 
@@ -384,6 +363,7 @@ class NearestNeighborhoodUpsample(nn.Module):
         x = self.conv(x)
 
         return x
+
 
 class EqualLinear(nn.Module):
     def __init__(self, dim, dim_out, lr_mul=1, bias=True):
@@ -431,7 +411,6 @@ class StyleGanNetwork(nn.Module):
 
 
 class UnetUpsampler(torch.nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -446,7 +425,6 @@ class UnetUpsampler(torch.nn.Module):
         channels: int = 3,
         resnet_block_groups: int = 8,
         full_attn: tuple = (False, False, False, True, True),
-        flash_attn: bool = True,
         self_attn_dim_head: int = 64,
         self_attn_heads: int = 8,
         attn_depths: tuple = (2, 2, 2, 2, 4),
@@ -497,7 +475,7 @@ class UnetUpsampler(torch.nn.Module):
             style_dims=style_embed_split_dims,
         )
 
-        FullAttention = partial(Transformer, flash_attn=flash_attn)
+        FullAttention = partial(Transformer)
         *_, mid_dim = up_dims
 
         self.skip_connect_scale = default(skip_connect_scale, 2**-0.5)
@@ -714,7 +692,11 @@ def tile_image(image, chunk_size=64):
     tiles = []
     for i in range(h_chunks):
         for j in range(w_chunks):
-            tile = image[:, i * chunk_size:(i + 1) * chunk_size, j * chunk_size:(j + 1) * chunk_size]
+            tile = image[
+                :,
+                i * chunk_size : (i + 1) * chunk_size,
+                j * chunk_size : (j + 1) * chunk_size,
+            ]
             tiles.append(tile)
     return tiles, h_chunks, w_chunks
 
@@ -737,7 +719,7 @@ def merge_tiles(tiles, h_chunks, w_chunks, chunk_size=64):
         w_start = j * chunk_size
 
         tile_h, tile_w = tile.shape[1:]
-        merged[:, h_start:h_start+tile_h, w_start:w_start+tile_w] = tile
+        merged[:, h_start : h_start + tile_h, w_start : w_start + tile_w] = tile
 
     return merged
 
@@ -748,7 +730,9 @@ class AuraSR:
         self.input_image_size = config["input_image_size"]
 
     @classmethod
-    def from_pretrained(cls, model_id: str = "fal-ai/AuraSR", use_safetensors: bool = True):
+    def from_pretrained(
+        cls, model_id: str = "fal-ai/AuraSR", use_safetensors: bool = True
+    ):
         import json
         import torch
         from pathlib import Path
@@ -757,15 +741,17 @@ class AuraSR:
         # Check if model_id is a local file
         if Path(model_id).is_file():
             local_file = Path(model_id)
-            if local_file.suffix == '.safetensors':
+            if local_file.suffix == ".safetensors":
                 use_safetensors = True
-            elif local_file.suffix == '.ckpt':
+            elif local_file.suffix == ".ckpt":
                 use_safetensors = False
             else:
-                raise ValueError(f"Unsupported file format: {local_file.suffix}. Please use .safetensors or .ckpt files.")
-            
+                raise ValueError(
+                    f"Unsupported file format: {local_file.suffix}. Please use .safetensors or .ckpt files."
+                )
+
             # For local files, we need to provide the config separately
-            config_path = local_file.with_name('config.json')
+            config_path = local_file.with_name("config.json")
             if not config_path.exists():
                 raise FileNotFoundError(
                     f"Config file not found: {config_path}. "
@@ -774,7 +760,7 @@ class AuraSR:
                     f"If you're trying to load a model from Hugging Face, "
                     f"please provide the model ID instead of a file path."
                 )
-            
+
             config = json.loads(config_path.read_text())
             hf_model_path = local_file.parent
         else:
@@ -786,7 +772,12 @@ class AuraSR:
         if use_safetensors:
             try:
                 from safetensors.torch import load_file
-                checkpoint = load_file(hf_model_path / "model.safetensors" if not Path(model_id).is_file() else model_id)
+
+                checkpoint = load_file(
+                    hf_model_path / "model.safetensors"
+                    if not Path(model_id).is_file()
+                    else model_id
+                )
             except ImportError:
                 raise ImportError(
                     "The safetensors library is not installed. "
@@ -794,7 +785,11 @@ class AuraSR:
                     "or use `use_safetensors=False` to load the model with PyTorch."
                 )
         else:
-            checkpoint = torch.load(hf_model_path / "model.ckpt" if not Path(model_id).is_file() else model_id)
+            checkpoint = torch.load(
+                hf_model_path / "model.ckpt"
+                if not Path(model_id).is_file()
+                else model_id
+            )
 
         model.upsampler.load_state_dict(checkpoint, strict=True)
         return model
@@ -806,29 +801,40 @@ class AuraSR:
 
         image_tensor = tensor_transform(image).unsqueeze(0)
         _, _, h, w = image_tensor.shape
-        pad_h = (self.input_image_size - h % self.input_image_size) % self.input_image_size
-        pad_w = (self.input_image_size - w % self.input_image_size) % self.input_image_size
+        pad_h = (
+            self.input_image_size - h % self.input_image_size
+        ) % self.input_image_size
+        pad_w = (
+            self.input_image_size - w % self.input_image_size
+        ) % self.input_image_size
 
         # Pad the image
-        image_tensor = torch.nn.functional.pad(image_tensor, (0, pad_w, 0, pad_h), mode='reflect').squeeze(0)
+        image_tensor = torch.nn.functional.pad(
+            image_tensor, (0, pad_w, 0, pad_h), mode="reflect"
+        ).squeeze(0)
         tiles, h_chunks, w_chunks = tile_image(image_tensor, self.input_image_size)
 
         # Batch processing of tiles
         num_tiles = len(tiles)
-        batches = [tiles[i:i + max_batch_size] for i in range(0, num_tiles, max_batch_size)]
+        batches = [
+            tiles[i : i + max_batch_size] for i in range(0, num_tiles, max_batch_size)
+        ]
         reconstructed_tiles = []
 
         for batch in batches:
             model_input = torch.stack(batch).to(device)
             generator_output = self.upsampler(
                 lowres_image=model_input,
-                noise=torch.randn(model_input.shape[0], 128, device=device)
+                noise=torch.randn(model_input.shape[0], 128, device=device),
             )
-            reconstructed_tiles.extend(list(generator_output.clamp_(0, 1).detach().cpu()))
+            reconstructed_tiles.extend(
+                list(generator_output.clamp_(0, 1).detach().cpu())
+            )
 
-        merged_tensor = merge_tiles(reconstructed_tiles, h_chunks, w_chunks, self.input_image_size * 4)
-        unpadded = merged_tensor[:, :h * 4, :w * 4]
+        merged_tensor = merge_tiles(
+            reconstructed_tiles, h_chunks, w_chunks, self.input_image_size * 4
+        )
+        unpadded = merged_tensor[:, : h * 4, : w * 4]
 
         to_pil = transforms.ToPILImage()
         return to_pil(unpadded)
-
